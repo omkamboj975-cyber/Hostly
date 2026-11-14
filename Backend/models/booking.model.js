@@ -50,6 +50,14 @@ const bookingSchema = new Schema(
             maxLength: [500, "Special requests must not exceed 500 characters"],
             default: "",
         },
+        paymentStatus: {
+            type: String,
+            enum: ["pending", "paid", "failed", "refunded"],
+            default: "pending",
+        },
+        paymentProvider: { type: String, default: "mock" },
+        paymentOrderId: { type: String, index: true },
+        paymentId: { type: String },
     },
     { timestamps: true }
 );

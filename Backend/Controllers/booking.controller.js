@@ -1,62 +1,136 @@
+import crypto from "crypto";
 import Booking from "../models/booking.model.js";
 import Listing from "../models/listing.model.js";
 import ExpressError from "../Middlewares/ExpressError.js";
 
-export const createBooking = async (req, res, next) => {
-	if (!req.body.booking) {
-		return next(new ExpressError(400, "Invalid booking data!"));
+// Demo payment gateway. Signs payments with a server-side secret,
+// the same way a real gateway does. Reuses SESSION_SECRET so no new env var is needed.
+const signPayment = (orderId, paymentId) =>
+	crypto
+		.createHmac("sha256", process.env.SESSION_SECRET || "demo-secret")
+		.update(`${orderId}|${paymentId}`)
+		.digest("hex");
+
+// Step A: validate, calculate price on the server, create a pending booking + mock order
+export const createOrder = async (req, res) => {
+	const { id } = req.params;
+	const { checkIn, checkOut, guests, specialRequests } = req.body.booking || {};
+
+	const listing = await Listing.findById(id);
+	if (!listing) return res.status(404).json({ error: "Listing not found!" });
+	if (!listing.isAvailable || listing.listingStatus !== "active") {
+		return res.status(400).json({ error: "This listing is not available for booking." });
 	}
 
-	const listingId = req.params.id || req.body.booking.listing;
-	if (!listingId) {
-		return next(new ExpressError(400, "Listing id is required!"));
+	const inDate = new Date(checkIn);
+	const outDate = new Date(checkOut);
+	const today = new Date();
+	today.setHours(0, 0, 0, 0);
+
+	if (isNaN(inDate) || isNaN(outDate) || outDate <= inDate || inDate < today) {
+		return res.status(400).json({ error: "Please choose valid check-in and check-out dates." });
 	}
 
-	const listing = await Listing.findById(listingId);
-	if (!listing) {
-		return next(new ExpressError(404, "Listing not found!"));
+	const guestCount = Number(guests);
+	if (!Number.isInteger(guestCount) || guestCount < 1 || guestCount > 20) {
+		return res.status(400).json({ error: "Guests must be between 1 and 20." });
 	}
 
-	const newBooking = new Booking({
-		...req.body.booking,
-		listing: listingId,
+	// Block double-booking of already confirmed stays
+	const clash = await Booking.exists({
+		listing: id,
+		status: "confirmed",
+		checkIn: { $lt: outDate },
+		checkOut: { $gt: inDate },
+	});
+	if (clash) {
+		return res.status(409).json({ error: "These dates are already booked." });
+	}
+
+	// Price is calculated here, never trusted from the browser
+	const nights = Math.round((outDate - inDate) / (1000 * 60 * 60 * 24));
+	const totalPrice = nights * listing.price;
+
+	const orderId = "order_mock_" + crypto.randomBytes(8).toString("hex");
+
+	await Booking.create({
+		listing: id,
 		user: req.user._id,
+		checkIn: inDate,
+		checkOut: outDate,
+		guests: guestCount,
+		totalPrice,
+		specialRequests: specialRequests || "",
+		status: "pending",
+		paymentStatus: "pending",
+		paymentProvider: "mock",
+		paymentOrderId: orderId,
 	});
 
-	try {
-		const paymentUrl = process.env.PAYMENT_URL || "http://localhost:7000/payments";
-		const paymentRes = await fetch(paymentUrl, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json"
-			},
-			body: JSON.stringify({
-				amount: newBooking.totalPrice,
-				currency: "INR",
-				paymentMethod: "card",
-				customerName: req.user.firstName || "Guest",
-				reference: newBooking._id.toString()
-			})
-		});
+	res.json({ orderId, amount: totalPrice, currency: "INR" });
+};
 
-		const paymentData = await paymentRes.json();
+// Step B: the fake gateway. Stands in for the Razorpay popup.
+// Remove this function and its route when you switch to real Razorpay.
+export const mockPay = async (req, res) => {
+	const { orderId, outcome } = req.body;
 
-		if (!paymentRes.ok || paymentData?.transaction?.status !== "APPROVED") {
-			req.flash("error", "Payment declined or failed. Please try again.");
-			return res.redirect(`/booking/${listingId}/bookings/new`);
-		}
+	const booking = await Booking.findOne({
+		paymentOrderId: orderId,
+		user: req.user._id,
+		paymentStatus: "pending",
+	});
+	if (!booking) return res.status(404).json({ error: "Order not found." });
 
-		newBooking.status = "confirmed";
-	} catch (error) {
-		console.error("Payment Error:", error);
-		req.flash("error", "Payment gateway is currently unreachable.");
-		return res.redirect(`/booking/${listingId}/bookings/new`);
+	if (outcome !== "success") {
+		booking.paymentStatus = "failed";
+		await booking.save();
+		return res.status(402).json({ error: "Payment declined. Please try another card." });
 	}
 
-	await newBooking.save();
+	const paymentId = "pay_mock_" + crypto.randomBytes(8).toString("hex");
+	res.json({
+		orderId,
+		paymentId,
+		signature: signPayment(orderId, paymentId),
+	});
+};
+
+// Step C: verify the signature, then confirm the booking
+export const verifyPayment = async (req, res) => {
+	const { orderId, paymentId, signature } = req.body;
+
+	if (!orderId || !paymentId || !signature) {
+		return res.status(400).json({ error: "Invalid payment data." });
+	}
+
+	const booking = await Booking.findOne({
+		paymentOrderId: orderId,
+		user: req.user._id,
+	});
+	if (!booking) return res.status(404).json({ error: "Booking not found." });
+
+	const a = Buffer.from(signPayment(orderId, paymentId));
+	const b = Buffer.from(String(signature));
+	const valid = a.length === b.length && crypto.timingSafeEqual(a, b);
+
+	if (!valid) {
+		if (booking.paymentStatus !== "paid") {
+			booking.paymentStatus = "failed";
+			await booking.save();
+		}
+		return res.status(400).json({ error: "Payment verification failed." });
+	}
+
+	if (booking.paymentStatus !== "paid") {
+		booking.paymentStatus = "paid";
+		booking.status = "confirmed";
+		booking.paymentId = paymentId;
+		await booking.save();
+	}
 
 	req.flash("success", "Booking and Payment successful!");
-	res.redirect(`/listing/${listingId}`);
+	res.json({ redirect: `/listing/${booking.listing}` });
 };
 
 export const getBookingForm = async (req, res, next) => {

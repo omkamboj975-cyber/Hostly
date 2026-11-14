@@ -26,6 +26,7 @@ const require = createRequire(import.meta.url);
 const LocalStrategy = require('passport-local').Strategy;
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(cors());
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -45,6 +46,8 @@ app.set("views", path.join(__dirname, "views"));
 app.engine("ejs", ejsMate);
 
 app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(methodOverride("_method"));
 app.use(express.static(path.join(__dirname, "public")));
 
