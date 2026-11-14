@@ -2,17 +2,62 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 dotenv.config();
 
-const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_PASS,
+// Local fallback: Gmail SMTP (blocked on Render's free plan)
+let gmailTransporter;
+const getGmailTransporter = () => {
+    if (!gmailTransporter) {
+        gmailTransporter = nodemailer.createTransport({
+            service: 'gmail',
+            auth: {
+                user: process.env.GMAIL_USER,
+                pass: process.env.GMAIL_PASS,
+            }
+        });
     }
-});
+    return gmailTransporter;
+};
+
+// Production: Brevo over HTTPS
+const sendWithBrevo = async ({ to, subject, html }) => {
+    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+            'api-key': process.env.BREVO_API_KEY,
+            'Content-Type': 'application/json',
+            'accept': 'application/json',
+        },
+        body: JSON.stringify({
+            sender: {
+                name: 'Hotspot',
+                email: process.env.BREVO_SENDER_EMAIL || process.env.GMAIL_USER,
+            },
+            to: [{ email: to }],
+            subject,
+            htmlContent: html,
+        }),
+    });
+
+    if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        console.error('Brevo error:', res.status, text);
+        throw new Error('Failed to send email');
+    }
+};
+
+const sendMail = async ({ to, subject, html }) => {
+    if (process.env.BREVO_API_KEY) {
+        return sendWithBrevo({ to, subject, html });
+    }
+    return getGmailTransporter().sendMail({
+        from: `"Hotspot" <${process.env.GMAIL_USER}>`,
+        to,
+        subject,
+        html,
+    });
+};
 
 export const sendOTPEmail = async (email, otp, firstName) => {
-    await transporter.sendMail({
-        from: `"Hotspot" <${process.env.GMAIL_USER}>`,
+    await sendMail({
         to: email,
         subject: "Verify your Hotspot account",
         html: `
